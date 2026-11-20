@@ -146,3 +146,116 @@ def clear_decision(connection, job_id, box_id):
         "DELETE FROM decisions WHERE job_id = ? AND box_id = ?", (job_id, box_id)
     )
     connection.commit()
+
+
+# ---------------------------------------------------------------------------
+# Re-OCR'd new version (one per job) and per-group side choices
+# ---------------------------------------------------------------------------
+
+def get_variant(connection, job_id):
+    row = connection.execute(
+        "SELECT * FROM variants WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def replace_variant(connection, job_id, filename, rows):
+    """Swap in a new-version CSV.  Does NOT commit: the caller wraps this in
+    one transaction together with the choice pruning, so a failure anywhere
+    leaves the previous version untouched."""
+    connection.execute("DELETE FROM new_boxes WHERE job_id = ?", (job_id,))
+    # new_decisions rows disappear through ON DELETE CASCADE.
+    for row in rows:
+        connection.execute(
+            "INSERT INTO new_boxes"
+            " (job_id, row_no, box_ref, text, x1, y1, x2, y2)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, row["row_no"], row["box_ref"], row["text"],
+             row["x1"], row["y1"], row["x2"], row["y2"]),
+        )
+    connection.execute(
+        "INSERT INTO variants (job_id, filename, created_at)"
+        " VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        " ON CONFLICT (job_id) DO UPDATE SET"
+        " filename = excluded.filename, created_at = excluded.created_at",
+        (job_id, filename),
+    )
+
+
+def get_new_boxes(connection, job_id):
+    rows = connection.execute(
+        "SELECT * FROM new_boxes WHERE job_id = ? ORDER BY row_no", (job_id,)
+    ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def get_new_decisions(connection, job_id):
+    rows = connection.execute(
+        "SELECT * FROM new_decisions WHERE job_id = ?", (job_id,)
+    ).fetchall()
+    decisions = {}
+    for row in rows:
+        record = dict(row)
+        try:
+            record["overlap_cells"] = json.loads(record["overlap_cells"] or "[]")
+        except ValueError:
+            record["overlap_cells"] = []
+        decisions[record["box_id"]] = record
+    return decisions
+
+
+def set_new_decision(connection, job_id, box_id, kind, target_cell, overlap_cells):
+    connection.execute(
+        "INSERT INTO new_decisions"
+        " (job_id, box_id, kind, target_cell, overlap_cells)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT (job_id, box_id) DO UPDATE SET"
+        " kind = excluded.kind, target_cell = excluded.target_cell,"
+        " overlap_cells = excluded.overlap_cells,"
+        " created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        (job_id, box_id, kind, target_cell,
+         json.dumps(sorted(overlap_cells), ensure_ascii=False)),
+    )
+    connection.commit()
+
+
+def clear_new_decision(connection, job_id, box_id):
+    connection.execute(
+        "DELETE FROM new_decisions WHERE job_id = ? AND box_id = ?", (job_id, box_id)
+    )
+    connection.commit()
+
+
+def get_group_choices(connection, job_id):
+    rows = connection.execute(
+        "SELECT group_key, side FROM group_choices WHERE job_id = ?", (job_id,)
+    ).fetchall()
+    return {row["group_key"]: row["side"] for row in rows}
+
+
+def set_group_choice(connection, job_id, group_key, side):
+    connection.execute(
+        "INSERT INTO group_choices (job_id, group_key, side) VALUES (?, ?, ?)"
+        " ON CONFLICT (job_id, group_key) DO UPDATE SET"
+        " side = excluded.side,"
+        " created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        (job_id, group_key, side),
+    )
+    connection.commit()
+
+
+def prune_group_choices(connection, job_id, keep_keys):
+    """Drop choices whose group no longer exists.  Does NOT commit (see
+    replace_variant)."""
+    keys = list(keep_keys)
+    if keys:
+        placeholders = ",".join("?" for _ in keys)
+        connection.execute(
+            f"DELETE FROM group_choices WHERE job_id = ?"
+            f" AND group_key NOT IN ({placeholders})",
+            (job_id, *keys),
+        )
+    else:
+        connection.execute(
+            "DELETE FROM group_choices WHERE job_id = ?", (job_id,)
+        )

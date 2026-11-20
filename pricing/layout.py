@@ -21,6 +21,7 @@ STATUS_LABELS = {
     "pending": "待核",
     "stale": "待重新确认",
     "excluded": "已排除",
+    "inactive": "未采用",
 }
 
 

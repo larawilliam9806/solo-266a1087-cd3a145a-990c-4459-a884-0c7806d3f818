@@ -26,6 +26,7 @@ from flask import (
     url_for,
 )
 
+from . import compare
 from . import db
 from . import layout
 from .csvparse import CsvError, parse_csv
@@ -73,9 +74,22 @@ def create_app(config=None):
     # ------------------------------------------------------------------
     def job_state(job_id):
         connection = get_db()
-        job = load_job_or_404(job_id)
-        boxes = db.get_boxes(connection, job_id)
-        horizontal, vertical = db.get_lines(connection, job_id)
+        # Everything below is read inside one snapshot: the version choices,
+        # ruling lines and decisions behind any rendered state or exported
+        # CSV must come from a single saved state, never from a mix.
+        connection.execute("BEGIN")
+        try:
+            job = load_job_or_404(job_id)
+            boxes = db.get_boxes(connection, job_id)
+            new_boxes = db.get_new_boxes(connection, job_id)
+            horizontal, vertical = db.get_lines(connection, job_id)
+            decisions = db.get_decisions(connection, job_id)
+            new_decisions = db.get_new_decisions(connection, job_id)
+            variant = db.get_variant(connection, job_id)
+            stored_choices = db.get_group_choices(connection, job_id)
+        finally:
+            connection.rollback()  # read-only snapshot, nothing to commit
+
         invalid = None
         grid = None
         if len(vertical) == 4 and len(horizontal) >= 2:
@@ -83,36 +97,93 @@ def create_app(config=None):
         else:
             invalid = _invalid_message(len(horizontal), len(vertical))
 
-        decisions = db.get_decisions(connection, job_id)
+        # Cross-version grouping.  Identical groups keep the original boxes;
+        # every other group needs a stored side choice before its boxes are
+        # used.  Choices pointing at vanished groups are ignored here and
+        # pruned when a new version is uploaded.
+        groups = compare.build_groups(boxes, new_boxes) if variant else []
+        diff_groups = [group for group in groups if not group["identical"]]
+        identical_count = len(groups) - len(diff_groups)
+        choices = {}
+        for group in diff_groups:
+            side = stored_choices.get(group["key"])
+            if side in ("old", "new"):
+                choices[group["key"]] = side
+        unchosen = len(diff_groups) - len(choices)
+
+        old_group_of = {}
+        new_group_of = {}
+        for group in groups:
+            for item in group["old"]:
+                old_group_of[item["box_id"]] = group
+            for item in group["new"]:
+                new_group_of[item["box_id"]] = group
+        group_key_of = {"old": {}, "new": {}}
+        for group in diff_groups:
+            for item in group["old"]:
+                group_key_of["old"][item["box_id"]] = group["key"]
+            for item in group["new"]:
+                group_key_of["new"][item["box_id"]] = group["key"]
+
+        active_old, active_new, inactive = [], [], []
+        if not variant:
+            active_old = list(boxes)
+        else:
+            for box in boxes:
+                group = old_group_of[box["id"]]
+                if group["identical"] or choices.get(group["key"]) == "old":
+                    active_old.append(box)
+                else:
+                    inactive.append(_inactive_item(box, "old", group, choices))
+            for box in new_boxes:
+                group = new_group_of[box["id"]]
+                if group["identical"]:
+                    continue  # identical groups keep the original boxes only
+                if choices.get(group["key"]) == "new":
+                    active_new.append(box)
+                else:
+                    inactive.append(_inactive_item(box, "new", group, choices))
+
         if grid is None:
-            evaluated = [
-                {
-                    "box_id": box["id"], "box_ref": box["box_ref"],
-                    "text": box["text"], "x1": box["x1"], "y1": box["y1"],
-                    "x2": box["x2"], "y2": box["y2"],
-                    "status": "pending", "status_label": "待划格线",
-                    "row": None, "col": None, "column": None,
-                    "cell_key": "", "candidates": [], "decision": None,
-                    "manual": False, "note": "格线无效，暂不归位",
-                }
-                for box in boxes
-            ]
+            evaluated = []
+            for side, side_boxes in (("old", active_old), ("new", active_new)):
+                for box in side_boxes:
+                    evaluated.append({
+                        "box_id": box["id"], "box_ref": box["box_ref"],
+                        "text": box["text"], "x1": box["x1"], "y1": box["y1"],
+                        "x2": box["x2"], "y2": box["y2"],
+                        "status": "pending", "status_label": "待划格线",
+                        "row": None, "col": None, "column": None,
+                        "cell_key": "", "candidates": [], "decision": None,
+                        "manual": False, "note": "格线无效，暂不归位",
+                        "side": side,
+                        "group_key": group_key_of[side].get(box["id"]),
+                    })
             pending = sum(1 for item in evaluated if (item["text"] or "").strip())
             rows = []
             if not invalid:
                 invalid = "尚未确认格线"
         else:
-            evaluated = layout.evaluate(grid, boxes, decisions)
+            evaluated = []
+            for side, side_boxes, side_decisions in (
+                    ("old", active_old, decisions),
+                    ("new", active_new, new_decisions)):
+                items = layout.evaluate(grid, side_boxes, side_decisions)
+                for item in items:
+                    item["side"] = side
+                    item["group_key"] = group_key_of[side].get(item["box_id"])
+                evaluated.extend(items)
             pending = layout.pending_count(evaluated)
             rows = layout.build_rows(evaluated)
 
+        all_items = evaluated + inactive
         status_counts = {}
-        for item in evaluated:
+        for item in all_items:
             status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
 
         return {
             "job": job,
-            "boxes": evaluated,
+            "boxes": all_items,
             "horizontal": horizontal,
             "vertical": vertical,
             "grid_valid": grid is not None,
@@ -120,8 +191,21 @@ def create_app(config=None):
             "pending": pending,
             "rows": rows,
             "status_counts": status_counts,
-            "can_export": grid is not None and pending == 0 and bool(boxes),
+            "can_export": (grid is not None and pending == 0
+                           and unchosen == 0 and bool(evaluated)),
             "cells": grid.cells() if grid is not None else [],
+            "variant": variant,
+            "groups": [
+                {
+                    "key": group["key"],
+                    "choice": choices.get(group["key"]),
+                    "old": group["old"],
+                    "new": group["new"],
+                }
+                for group in diff_groups
+            ],
+            "identical_groups": identical_count,
+            "unchosen_groups": unchosen,
         }
 
     def _invalid_message(h_count, v_count):
@@ -188,6 +272,56 @@ def create_app(config=None):
         flash("已删除该任务", "success")
         return redirect(url_for("index"))
 
+    @app.post("/jobs/<int:job_id>/version")
+    def upload_version(job_id):
+        """Attach (or replace) the re-OCR'd new version of this page.
+
+        One new version per job.  The whole swap is a single transaction: an
+        unparseable CSV or a save error leaves the previous version, its
+        decisions and the group choices exactly as they were.
+        """
+        load_job_or_404(job_id)
+        uploaded = request.files.get("file")
+        if uploaded is None or not uploaded.filename:
+            flash("请选择一个 CSV 文件", "error")
+            return redirect(url_for("job_view", job_id=job_id))
+        filename = os.path.basename(uploaded.filename)
+        raw = uploaded.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            flash("文件过大（上限 10MB）", "error")
+            return redirect(url_for("job_view", job_id=job_id))
+        try:
+            parsed = parse_csv(raw)
+        except CsvError as error:
+            for line in [error.message] + error.details:
+                flash(line, "error")
+            return redirect(url_for("job_view", job_id=job_id))
+
+        connection = get_db()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            db.replace_variant(connection, job_id, filename, parsed.boxes)
+            groups = compare.build_groups(
+                db.get_boxes(connection, job_id),
+                db.get_new_boxes(connection, job_id),
+            )
+            keep = {group["key"] for group in groups if not group["identical"]}
+            db.prune_group_choices(connection, job_id, keep)
+            connection.execute("COMMIT")
+        except Exception:
+            connection.rollback()
+            app.logger.exception("保存新版失败")
+            flash("保存新版失败，已保留操作前的状态", "error")
+            return redirect(url_for("job_view", job_id=job_id))
+
+        for warning in parsed.warnings[:20]:
+            flash(warning, "warning")
+        identical = sum(1 for group in groups if group["identical"])
+        diff = len(groups) - identical
+        flash(f"已导入新版 {len(parsed.boxes)} 个文字框：{identical} 组相同已沿用原框，"
+              f"{diff} 组有差异待逐组选版", "success")
+        return redirect(url_for("job_view", job_id=job_id))
+
     # ------------------------------------------------------------------
     # JSON API
     # ------------------------------------------------------------------
@@ -216,15 +350,45 @@ def create_app(config=None):
     @app.post("/api/jobs/<int:job_id>/suggest-lines")
     def api_suggest_lines(job_id):
         load_job_or_404(job_id)
-        boxes = db.get_boxes(get_db(), job_id)
-        horizontal, vertical = _suggest_lines(boxes)
+        state = job_state(job_id)
+        active = [item for item in state["boxes"] if item["status"] != "inactive"]
+        horizontal, vertical = _suggest_lines(active)
         return jsonify({"ok": True, "horizontal": horizontal, "vertical": vertical})
+
+    @app.post("/api/jobs/<int:job_id>/groups/<group_key>")
+    def api_set_group_choice(job_id, group_key):
+        """Pick one side of a difference group ('old' / 'new').
+
+        Always allowed, even after everything is export-ready: the choice can
+        be changed at any time.  Picking a side that has no boxes discards
+        the whole group.
+        """
+        load_job_or_404(job_id)
+        payload = request.get_json(silent=True) or {}
+        side = payload.get("side")
+        if side not in ("old", "new"):
+            return jsonify({"ok": False, "error": "未知的选版方向", "details": []}), 400
+        state = job_state(job_id)
+        group = next((g for g in state["groups"] if g["key"] == group_key), None)
+        if group is None:
+            return jsonify({
+                "ok": False,
+                "error": "该对照组已不存在（新版可能已更换），请刷新页面",
+                "details": [],
+            }), 409
+        db.set_group_choice(get_db(), job_id, group_key, side)
+        return jsonify(_json_state(job_state(job_id)))
 
     @app.post("/api/jobs/<int:job_id>/decisions")
     def api_set_decision(job_id):
         load_job_or_404(job_id)
         payload = request.get_json(silent=True) or {}
-        boxes = db.get_boxes(get_db(), job_id)
+        side = payload.get("side") or "old"
+        if side not in ("old", "new"):
+            return jsonify({"ok": False, "error": "未知的版本侧", "details": []}), 400
+        connection = get_db()
+        boxes = (db.get_new_boxes(connection, job_id) if side == "new"
+                 else db.get_boxes(connection, job_id))
         box = next((item for item in boxes if item["id"] == payload.get("box_id")), None)
         if box is None:
             return jsonify({"ok": False, "error": "文字框不存在"}), 404
@@ -232,7 +396,16 @@ def create_app(config=None):
         if not state["grid_valid"]:
             return jsonify({"ok": False, "error": state["invalid"], "details": []}), 409
         grid = layout.Grid(state["horizontal"], state["vertical"])
-        item = next(entry for entry in state["boxes"] if entry["box_id"] == box["id"])
+        item = next((entry for entry in state["boxes"]
+                     if entry["side"] == side and entry["box_id"] == box["id"]), None)
+        if item is None or item["status"] == "inactive":
+            # A stale window acting on a box whose group has been switched to
+            # the other side (or not chosen yet) must not go through.
+            return jsonify({
+                "ok": False,
+                "error": "该文字框当前未采用（所在对照组可能已切到另一侧），请刷新页面",
+                "details": [],
+            }), 409
         if item["status"] not in ("pending", "stale"):
             return jsonify({
                 "ok": False,
@@ -245,14 +418,38 @@ def create_app(config=None):
             )
         except layout.LayoutError as error:
             return jsonify({"ok": False, "error": error.message, "details": error.details}), 400
-        db.set_decision(get_db(), job_id, box["id"], decision["kind"],
-                        decision["target_cell"], decision["overlap_cells"])
+        if side == "new":
+            db.set_new_decision(connection, job_id, box["id"], decision["kind"],
+                                decision["target_cell"], decision["overlap_cells"])
+        else:
+            db.set_decision(connection, job_id, box["id"], decision["kind"],
+                            decision["target_cell"], decision["overlap_cells"])
         return jsonify(_json_state(job_state(job_id)))
 
     @app.delete("/api/jobs/<int:job_id>/decisions/<int:box_id>")
     def api_clear_decision(job_id, box_id):
         load_job_or_404(job_id)
-        db.clear_decision(get_db(), job_id, box_id)
+        side = request.args.get("side") or "old"
+        if side not in ("old", "new"):
+            return jsonify({"ok": False, "error": "未知的版本侧", "details": []}), 400
+        connection = get_db()
+        boxes = (db.get_new_boxes(connection, job_id) if side == "new"
+                 else db.get_boxes(connection, job_id))
+        if not any(item["id"] == box_id for item in boxes):
+            return jsonify({"ok": False, "error": "文字框不存在"}), 404
+        state = job_state(job_id)
+        item = next((entry for entry in state["boxes"]
+                     if entry["side"] == side and entry["box_id"] == box_id), None)
+        if item is None or item["status"] == "inactive":
+            return jsonify({
+                "ok": False,
+                "error": "该文字框当前未采用（所在对照组可能已切到另一侧），请刷新页面",
+                "details": [],
+            }), 409
+        if side == "new":
+            db.clear_new_decision(connection, job_id, box_id)
+        else:
+            db.clear_decision(connection, job_id, box_id)
         return jsonify(_json_state(job_state(job_id)))
 
     # ------------------------------------------------------------------
@@ -260,9 +457,14 @@ def create_app(config=None):
     # ------------------------------------------------------------------
     @app.get("/jobs/<int:job_id>/export.csv")
     def export_csv(job_id):
+        # job_state reads one consistent snapshot, so this CSV's version
+        # choices, ruling lines and decisions all come from the same saved
+        # state even if someone keeps switching groups meanwhile.
         state = job_state(job_id)
         if not state["grid_valid"]:
             abort(409, description=state["invalid"])
+        if state["unchosen_groups"] > 0:
+            abort(409, description=f"还有 {state['unchosen_groups']} 个对照组未选版，不能下载")
         if state["pending"] > 0:
             abort(409, description=f"还有 {state['pending']} 个文字框待核对，不能下载")
         buffer = io.StringIO()
@@ -298,8 +500,44 @@ def create_app(config=None):
     return app
 
 
+def _inactive_item(box, side, group, choices):
+    """Display record for a box that is currently not in use.
+
+    Either its difference group has no side choice yet (待选版) or the group
+    was switched to the other side (未采用).
+    """
+    x1, y1, x2, y2 = layout.box_bounds(box)
+    choice = choices.get(group["key"])
+    if choice is None:
+        note = "所在对照组尚未选版，暂不归位"
+    else:
+        note = "所在对照组已采用" + compare.SIDE_LABELS[choice]
+    return {
+        "box_id": box["id"],
+        "box_ref": box["box_ref"],
+        "text": (box["text"] or "").strip(),
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "status": "inactive",
+        "status_label": layout.STATUS_LABELS["inactive"],
+        "row": None,
+        "col": None,
+        "column": None,
+        "cell_key": "",
+        "candidates": [],
+        "decision": None,
+        "manual": False,
+        "note": note,
+        "side": side,
+        "group_key": group["key"],
+    }
+
+
 def _json_state(state):
     job = state["job"]
+    variant = state["variant"]
     return {
         "ok": True,
         "job": {"id": job["id"], "filename": job["filename"]},
@@ -313,6 +551,13 @@ def _json_state(state):
         "status_counts": state["status_counts"],
         "can_export": state["can_export"],
         "cells": state["cells"],
+        "variant": (
+            {"filename": variant["filename"], "created_at": variant["created_at"]}
+            if variant else None
+        ),
+        "groups": state["groups"],
+        "identical_groups": state["identical_groups"],
+        "unchosen_groups": state["unchosen_groups"],
     }
 
 

@@ -43,3 +43,46 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (job_id, box_id)
 );
+
+-- One re-OCR'd ("new version") CSV per job, same coordinate system.
+CREATE TABLE IF NOT EXISTS variants (
+    job_id      INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    filename    TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS new_boxes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    row_no      INTEGER NOT NULL,
+    box_ref     TEXT    NOT NULL DEFAULT '',
+    text        TEXT    NOT NULL DEFAULT '',
+    x1          REAL    NOT NULL,
+    y1          REAL    NOT NULL,
+    x2          REAL    NOT NULL,
+    y2          REAL    NOT NULL,
+    UNIQUE (job_id, row_no)
+);
+CREATE INDEX IF NOT EXISTS idx_new_boxes_job ON new_boxes(job_id);
+
+-- The new version keeps its own cell/exclude decisions, so switching a group
+-- between sides never loses the other side's work.
+CREATE TABLE IF NOT EXISTS new_decisions (
+    job_id       INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    box_id       INTEGER NOT NULL REFERENCES new_boxes(id) ON DELETE CASCADE,
+    kind         TEXT    NOT NULL CHECK (kind IN ('cell','exclude')),
+    target_cell  TEXT    NOT NULL DEFAULT '',
+    overlap_cells TEXT   NOT NULL DEFAULT '[]',
+    created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (job_id, box_id)
+);
+
+-- Per difference-group side choice ('old' / 'new').  Choosing a side that
+-- has no boxes discards the whole group.
+CREATE TABLE IF NOT EXISTS group_choices (
+    job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    group_key   TEXT    NOT NULL,
+    side        TEXT    NOT NULL CHECK (side IN ('old','new')),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (job_id, group_key)
+);

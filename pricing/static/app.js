@@ -22,6 +22,7 @@
     pending: "#b3261e",
     stale: "#a35a00",
     excluded: "#7a7266",
+    inactive: "#a89f8d",
   };
   const STATUS_LABELS = {
     assigned_auto: "自动归位",
@@ -29,13 +30,15 @@
     pending: "待核",
     stale: "待重新确认",
     excluded: "已排除",
+    inactive: "未采用",
   };
-  const STATUS_ORDER = ["assigned_auto", "assigned_manual", "pending", "stale", "excluded"];
+  const STATUS_ORDER = ["assigned_auto", "assigned_manual", "pending", "stale", "excluded", "inactive"];
   const COLUMN_LABELS = { name: "品名", spec: "规格", price: "批发价" };
+  const SIDE_LABELS = { old: "旧版", new: "新版" };
 
   let state = null;                 // last applied server state
   let draft = { h: [], v: [] };     // lines currently drawn (may be unapplied)
-  let selectedId = null;
+  let selected = null;              // {side, id} of the clicked box
   let bounds = { minX: 0, minY: 0, maxX: 1, maxY: 1 };
   let dragging = null;
 
@@ -153,10 +156,11 @@
 
     state.boxes.forEach(function (box) {
       const color = STATUS_COLORS[box.status] || "#999";
-      const selected = box.box_id === selectedId;
+      const isSelected = selected && box.side === selected.side && box.box_id === selected.id;
       const group = el("g", {
         "data-box-id": box.box_id,
-        class: "box" + (selected ? " sel" : ""),
+        "data-side": box.side,
+        class: "box" + (isSelected ? " sel" : ""),
       });
       group.appendChild(el("rect", {
         x: box.x1, y: box.y1,
@@ -164,10 +168,12 @@
         height: Math.max(box.y2 - box.y1, 0.5),
         rx: 1.5,
         fill: color,
-        "fill-opacity": selected ? "0.34" : (box.status === "excluded" ? "0.10" : "0.18"),
+        "fill-opacity": isSelected ? "0.34"
+          : (box.status === "excluded" || box.status === "inactive" ? "0.10" : "0.18"),
         stroke: color,
-        "stroke-width": selected ? 3 : 1.4,
-        "stroke-dasharray": (box.status === "excluded" || box.status === "stale") ? "4 2" : "none",
+        "stroke-width": isSelected ? 3 : 1.4,
+        "stroke-dasharray": (box.status !== "assigned_auto" && box.status !== "assigned_manual"
+          && box.status !== "pending") ? "4 2" : "none",
         class: "box-rect",
       }));
       if (box.text) {
@@ -183,7 +189,7 @@
       }
       group.addEventListener("click", function (event) {
         event.stopPropagation();
-        selectedId = box.box_id;
+        selected = { side: box.side, id: box.box_id };
         render();
         renderInspector();
       });
@@ -277,6 +283,9 @@
     } else if (state.pending) {
       pill.className = "pill warn";
       pill.textContent = "待核 " + state.pending + " 个框";
+    } else if (state.unchosen_groups) {
+      pill.className = "pill warn";
+      pill.textContent = "待选版 " + state.unchosen_groups + " 组";
     } else {
       pill.className = "pill good";
       pill.textContent = "全部归位，可下载";
@@ -304,11 +313,17 @@
       download.className = "button disabled";
       download.removeAttribute("href");
       download.setAttribute("aria-disabled", "true");
-      download.setAttribute("title", "没有待核框后才可下载");
+      download.setAttribute("title",
+        !state.grid_valid ? "格线无效，修正后才可下载"
+        : state.pending ? "没有待核框后才可下载"
+        : state.unchosen_groups ? "所有对照组选版后才可下载"
+        : "没有可导出的内容");
     }
 
     document.getElementById("pending-notice").hidden = !state.pending;
     document.getElementById("pending-count").textContent = state.pending;
+    document.getElementById("groups-notice").hidden = !state.unchosen_groups;
+    document.getElementById("groups-count").textContent = state.unchosen_groups;
 
     const dirty = !draftMatchesState();
     applyButton.classList.toggle("primary", dirty);
@@ -317,7 +332,10 @@
 
   // ------------------------------------------------------------- inspector
   function selectedBox() {
-    return state.boxes.find(function (box) { return box.box_id === selectedId; });
+    if (!selected) return null;
+    return state.boxes.find(function (box) {
+      return box.side === selected.side && box.box_id === selected.id;
+    }) || null;
   }
 
   function renderInspector() {
@@ -328,7 +346,9 @@
     }
     const color = STATUS_COLORS[box.status] || "#333";
     const parts = [
-      "<h3>框 " + escapeHtml(box.box_ref || box.box_id) + "</h3>",
+      "<h3>框 " + escapeHtml(box.box_ref || box.box_id) +
+        ' <span class="side-tag">' + escapeHtml(SIDE_LABELS[box.side] || box.side) +
+        "</span></h3>",
       '<dl class="kv">',
       "<dt>文字</dt><dd>" +
         (box.text ? escapeHtml(box.text) : '<span class="muted">（空）</span>') + "</dd>",
@@ -347,6 +367,27 @@
     if (box.note) {
       parts.push('<p class="' + (box.status === "stale" ? "note stale" : "note") + '">' +
         escapeHtml(box.note) + "</p>");
+    }
+
+    if (box.status === "inactive") {
+      if (box.group_key) {
+        parts.push('<div class="ops"><button type="button" id="goto-group">查看所在对照组</button></div>');
+      }
+      inspector.innerHTML = parts.join("");
+      const gotoGroup = document.getElementById("goto-group");
+      if (gotoGroup) {
+        gotoGroup.addEventListener("click", function () {
+          const card = document.getElementById("group-" + box.group_key);
+          if (card) {
+            if (card.scrollIntoView) {
+              card.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+            card.classList.add("flash-once");
+            setTimeout(function () { card.classList.remove("flash-once"); }, 1600);
+          }
+        });
+      }
+      return;
     }
 
     const actionable = box.status === "pending" || box.status === "stale";
@@ -382,6 +423,7 @@
       assign.addEventListener("click", function () {
         sendDecision({
           box_id: box.box_id,
+          side: box.side,
           kind: "cell",
           target_cell: document.getElementById("target-cell").value,
         });
@@ -390,13 +432,14 @@
     const exclude = document.getElementById("exclude-box");
     if (exclude) {
       exclude.addEventListener("click", function () {
-        sendDecision({ box_id: box.box_id, kind: "exclude" });
+        sendDecision({ box_id: box.box_id, side: box.side, kind: "exclude" });
       });
     }
     const clear = document.getElementById("clear-decision");
     if (clear) {
       clear.addEventListener("click", function () {
-        request("/api/jobs/" + jobId + "/decisions/" + box.box_id, { method: "DELETE" })
+        request("/api/jobs/" + jobId + "/decisions/" + box.box_id + "?side=" + box.side,
+          { method: "DELETE" })
           .then(applyState).catch(fail);
       });
     }
@@ -414,10 +457,11 @@
   function applyState(next) {
     state = next;
     draft = { h: next.horizontal.slice(), v: next.vertical.slice() };
-    if (selectedId && !selectedBox()) selectedId = null;
+    if (selected && !selectedBox()) selected = null;
     render();
     renderInspector();
     updatePreview();
+    renderGroups();
   }
 
   function updatePreview() {
@@ -434,6 +478,87 @@
       tbody.appendChild(tr);
     });
     document.getElementById("preview-empty").hidden = state.rows.length > 0;
+  }
+
+  // --------------------------------------------------------- version groups
+  function groupBadge(group) {
+    if (!group.choice) return '<span class="pill warn">待选版</span>';
+    const sideBoxes = group.choice === "old" ? group.old : group.new;
+    if (!sideBoxes.length) return '<span class="pill muted-pill">已舍弃</span>';
+    return '<span class="pill good">已用' +
+      escapeHtml(SIDE_LABELS[group.choice]) + "</span>";
+  }
+
+  function boxLine(item) {
+    return "<li><span class=\"g-ref\">" + escapeHtml(item.box_ref || item.box_id) +
+      "</span> " + (item.text ? escapeHtml(item.text) : '<span class="muted">（空）</span>') +
+      ' <span class="g-coords">(' +
+      [item.x1, item.y1, item.x2, item.y2].map(function (value) { return num(value); })
+        .join(", ") + ")</span></li>";
+  }
+
+  function renderGroups() {
+    const container = document.getElementById("groups");
+    if (!container) return;
+    const groups = state.groups || [];
+    const summary = document.getElementById("variant-summary");
+    if (state.variant) {
+      summary.textContent = "新版文件 " + state.variant.filename +
+        " · 相同组 " + state.identical_groups + "（沿用原框）" +
+        " · 差异组 " + groups.length +
+        (state.unchosen_groups ? "，待选 " + state.unchosen_groups : "，已全部选完");
+    } else {
+      summary.textContent = "";
+    }
+    document.getElementById("groups-empty").hidden = groups.length > 0;
+    if (state.variant && !groups.length) {
+      document.getElementById("groups-empty").textContent = "新版与旧版没有差异组。";
+    } else if (!state.variant) {
+      document.getElementById("groups-empty").textContent = "尚未上传新版。";
+    }
+    container.innerHTML = "";
+
+    groups.forEach(function (group, index) {
+      const card = document.createElement("div");
+      card.className = "group" + (group.choice ? "" : " unchosen");
+      card.id = "group-" + group.key;
+
+      const head = document.createElement("div");
+      head.className = "group-head";
+      head.innerHTML = "<strong>对照组 " + (index + 1) + "</strong>" + groupBadge(group);
+      card.appendChild(head);
+
+      const cols = document.createElement("div");
+      cols.className = "group-cols";
+      ["old", "new"].forEach(function (side) {
+        const items = group[side];
+        const col = document.createElement("div");
+        col.className = "group-side" + (group.choice === side ? " chosen" : "");
+        const list = items.length
+          ? "<ul>" + items.map(boxLine).join("") + "</ul>"
+          : '<p class="muted g-empty">（空）</p>';
+        const hint = items.length ? "" :
+          '<span class="muted">（选则舍弃整组）</span>';
+        col.innerHTML = "<h4>" + escapeHtml(SIDE_LABELS[side]) + "</h4>" + list +
+          '<label class="pick"><input type="radio" name="group-' + group.key +
+          '" value="' + side + '"' + (group.choice === side ? " checked" : "") +
+          "> 用" + escapeHtml(SIDE_LABELS[side]) + hint + "</label>";
+        cols.appendChild(col);
+      });
+      card.appendChild(cols);
+      container.appendChild(card);
+
+      card.querySelectorAll('input[type="radio"]').forEach(function (radio) {
+        radio.addEventListener("change", function () {
+          if (!radio.checked) return;
+          request("/api/jobs/" + jobId + "/groups/" + group.key, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ side: radio.value }),
+          }).then(applyState).catch(fail);
+        });
+      });
+    });
   }
 
   // ----------------------------------------------------------- line editing
@@ -515,8 +640,8 @@
   });
 
   svg.addEventListener("click", function () {
-    if (selectedId !== null) {
-      selectedId = null;
+    if (selected !== null) {
+      selected = null;
       render();
       renderInspector();
     }

@@ -22,6 +22,31 @@
   <p class="notice bad" id="invalid-message" {% if state.grid_valid %}hidden{% endif %}></p>
 </section>
 
+<section class="card" id="version-card">
+  <div class="panel-head">
+    <h2>新版对照</h2>
+    <span class="muted" id="variant-summary">
+      {%- if state.variant -%}
+      新版文件 {{ state.variant.filename }} · 相同组 {{ state.identical_groups }}（沿用原框） · 差异组 {{ state.groups|length }}
+      {%- endif -%}
+    </span>
+  </div>
+  <form class="upload" method="post" action="{{ url_for('upload_version', job_id=job.id) }}"
+        enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv,text/csv,text/plain" required>
+    <button type="submit">{{ '替换新版' if state.variant else '上传新版' }}</button>
+  </form>
+  <p class="muted">
+    同一张报纸重新识别后，在此上传同坐标系的 UTF-8 OCR CSV（每页限一份新版，重复上传即替换）。
+    跨版有面积重叠的框自动连成组：内容相同的组沿用原框；有差异的组并排列出文字与坐标，
+    逐组选择取用旧版或新版（可随时改选），选到空的一侧即舍弃整组。未选版的组暂不计入下方预览。
+  </p>
+  <div id="groups"></div>
+  <p class="muted" id="groups-empty" {% if state.groups %}hidden{% endif %}>
+    {%- if state.variant %}新版与旧版没有差异组。{% else %}尚未上传新版。{% endif -%}
+  </p>
+</section>
+
 <section class="card">
   <div class="panel-head">
     <h2>文字框与格线</h2>
@@ -31,6 +56,7 @@
       <span><i class="swatch pending"></i>待核</span>
       <span><i class="swatch stale"></i>待重确认</span>
       <span><i class="swatch excluded"></i>已排除</span>
+      <span><i class="swatch inactive"></i>未采用</span>
     </div>
   </div>
   <div class="viewer" id="viewer" data-job-id="{{ job.id }}">
@@ -101,6 +127,9 @@
   <p class="muted" id="preview-empty" {% if state.rows %}hidden{% endif %}>暂无可导出的行。</p>
   <p class="notice warn" id="pending-notice" {% if not state.pending %}hidden{% endif %}>
     还有 <span id="pending-count">{{ state.pending }}</span> 个文字框待核对，全部处理完才能下载。
+  </p>
+  <p class="notice warn" id="groups-notice" {% if not state.unchosen_groups %}hidden{% endif %}>
+    还有 <span id="groups-count">{{ state.unchosen_groups }}</span> 个对照组未选版，选完才能下载。
   </p>
 </section>
 
